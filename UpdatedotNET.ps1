@@ -1,6 +1,6 @@
-#Author: kingzettwb
-#Date: 2025-06-06
-#Description: Gets a list of any installed .NET applications (.NET Runtime, .NET Core and ASP.NET Core), uninstalls the old versions, then downloads and installs the latest
+#Author: Bill Kingzett
+#Date: 2026-07-01
+#Description: Gets a list of any installed .NET applications (.NET Runtime, .NET Core and ASP.NET Core), uninstalls the old versions, then downloads and installs the latest version (within the current major version unless it's EoL)
 #
 #Error codes:
 #0: Success or not installed
@@ -12,7 +12,10 @@
 #Download strings: https://www.powershellgallery.com/packages/Evergreen/2505.2104/Content/Manifests%5CMicrosoft.NET.json
 #Thanks to Aaron Parker for the Evergreen module
 #Creating Regex to match on multiple items: https://stackoverflow.com/questions/77748195/powershell-wildcard-array-in-the-where-clause
-$LogLocation = "C:\temp\Logs"
+
+$ForceLTS = $true
+$UpgradeBeforeEoL = $false
+$LogLocation = "C:\Temp\Logs"
 
 function Uninstall-App
 {
@@ -29,7 +32,7 @@ function Uninstall-App
         $commandArgs += "/norestart"
         $commandArgs += "IGNOREDEPENDENCIES=ALL"
         $commandArgs += "/l*v"
-        $commandArgs += "$LogLocation\dotNET-RemovalMSI.log"
+        $commandArgs += "C:\ProgramData\Genome\Logs\doNET-RemovalMSI.log"
         Write-Host "[$(Get-Date -Format "yyyy-MM-dd HH:mm:ss")] Running uninstall: msiexec.exe $CommandArgs"
         $proc = start-process "msiexec.exe" -ArgumentList $CommandArgs -Wait -PassThru
         return $proc.ExitCode
@@ -70,8 +73,8 @@ function Wildcard-toRegex($WildcardString) #Takes a string or array of strings, 
 
 if (!(Get-Item -Path $LogLocation -ErrorAction SilentlyContinue))
 {
-  if (!(Get-Item -Path $LogLocation.substring(0, $LogLocation.LastIndexOf('\') -ErrorAction SilentlyContinue)
-  {New-Item -Path $LogLocation.substring(0, $LogLocation.LastIndexOf('\') -ItemType Directory}
+  if (!(Get-Item -Path $LogLocation.substring(0, $LogLocation.LastIndexOf('\'))))
+  {New-Item -Path $LogLocation.substring(0, $LogLocation.LastIndexOf('\'))}
   New-Item -Path $LogLocation -ItemType Directory
 }
 
@@ -95,7 +98,6 @@ $regpath = @(
 $ContentType = "application/json; charset=utf-8"
 $Method = "Default"
 $SslProtocol = "Tls12"
-$UserAgent = [Microsoft.PowerShell.Commands.PSUserAgent]::Chrome
 $ReleasesURI = "https://dotnetcli.blob.core.windows.net/dotnet/release-metadata/#version/releases.json" #Release Dates, Files, EoL Dates, etc
 $LatestURI = "https://dotnetcli.blob.core.windows.net/dotnet/Runtime/LTS/latest.version" #Version of latest LTS
 $params = @{
@@ -105,7 +107,6 @@ $params = @{
         MaximumRedirection = 2
         Method             = $Method
         UseBasicParsing    = $true
-        UserAgent          = $UserAgent
     }
 
 $Regex = Wildcard-toRegex $Programs
@@ -139,16 +140,20 @@ foreach ($app in $Installed)
     if ($Architecture -eq "(x86)")
     {
         $Architecture = "win-x86" #The architecture of the program so we can download the correct version
-    } else
+    } elseif ($Architecture -eq "(x64)")
     { #If for some reason we fail to get the architecture, assume 64-bit
+        $Architecture = "win-x64"
+    } else
+    {
+        Write-Host "Unable to determine Architecture. Assuming 64-bit."
         $Architecture = "win-x64"
     }
     $MajorMinor = "$($AppVersion.Major).$($AppVersion.Minor)"
     $params.Uri = $ReleasesUri -replace "#version", $MajorMinor
     $Releases = Invoke-RestMethod @params #Get information about installed version
 
-    if ($Releases.'release-type' -ne 'lts' -or $AppVersion -lt $LatestVersion) #If not long-term service (8, probably 10), remove. Also remove if there's a newer LTS
-    {
+    if (($ForceLTS -eq $true -and $Releases.'release-type' -ne 'lts') -or ([version]$AppVersion -lt [version]$Releases.'latest-release' -and $Releases.'support-phase' -ne 'eol'))
+    { #If not long-term service (8, 10) and not exempted or if it's EoL, remove. Also continue if there's a newer LTS available
         $AppNameOnly = ($App.DisplayName -split "[-0-9]")[0] #Removes version info to get name only
         $type = switch -Wildcard ($AppNameOnly)
         {
@@ -156,8 +161,16 @@ foreach ($app in $Installed)
             "*ASP.NET Core*" {'aspnetcore-runtime'}
             "*Windows Desktop Runtime*" {'windowsdesktop'}
         }
-        $DownloadURL = $LatestReleases.releases[0]."$Type".files | where {$_.name -match "\.exe$" -and $_.rid -eq $Architecture} | Select -Property "url" -ExpandProperty "url"
-        $LatestAppName = $App.DisplayName -replace "$($AppVersion.ToString())", "$($LatestVersion.ToString())"
+        
+        #Update within major version if not EoL
+        if ([version]$AppVersion -lt [version]$Releases.'latest-release' -and $Releases.'support-phase' -ne 'eol' -and $UpgradeBeforeEoL -eq $false -and $Releases.'release-type' -eq 'lts')
+        {#Update within current version
+            $DownloadURL = $Releases.releases[0]."$Type".files | where {$_.name -match "\.exe$" -and $_.rid -eq $Architecture} | Select -Property "url" -ExpandProperty "url"
+            $LatestAppName = $App.DisplayName -replace "$($AppVersion.ToString())", "$($Releases.'latest-release')"
+        } else {#Update to latest version
+            $DownloadURL = $LatestReleases.releases[0]."$Type".files | where {$_.name -match "\.exe$" -and $_.rid -eq $Architecture} | Select -Property "url" -ExpandProperty "url"
+            $LatestAppName = $App.DisplayName -replace "$($AppVersion.ToString())", "$($LatestVersion.ToString())"
+            }
         $MarkedforAddition += [pscustomobject]@{Application="$LatestAppName";Architechture="$Architecture";URL="$DownloadURL";AppVersion="$AppVersion"}
         Write-Host "[$(Get-Date -Format "yyyy-MM-dd HH:mm:ss")] Uninstalling $($App.DisplayName) ..."
         if ($app.QuietUninstallString -ne $null) {$app.UninstallString = $app.QuietUninstallString}
@@ -196,12 +209,33 @@ foreach ($app in $Installed)
           } else {Write-Host "[$(Get-Date -Format "yyyy-MM-dd HH:mm:ss")] Uninstall successful."}
         } else
         {
-            Write-Host "[$(Get-Date -Format "yyyy-MM-dd HH:mm:ss")] $($App.DisplayName) is the latest version. Skipping..."
+            Write-Host "[$(Get-Date -Format "yyyy-MM-dd HH:mm:ss")] $($App.DisplayName) is the latest version or exempt. Skipping..."
         }
 }
 
 #Run installs
-$MarkedforAddition = $MarkedforAddition | Select -Unique
+$MarkedforAddition = $MarkedforAddition | Sort-Object -Property * -Unique
+Write-Host "Found for addition: $($MarkedforAddition | Select Application -expandproperty Application)"
+
+#Microsoft Windows Desktop Runtime includes Microsoft .NET Runtime. If a Desktop Runtime of the same architecture is installed, skip .NET Runtime install
+$Runtime = $MarkedforAddition | Where Application -Like "Microsoft .NET Runtime*"
+$WithoutRuntime = $MarkedforAddition | Where Application -NotLike "Microsoft .NET Runtime*"
+
+if ($Runtime -ne $null)
+{
+    $NewMarkedforAddition = @()
+    foreach ($NETRuntime in $Runtime)
+    {
+        if (($WithoutRuntime | Where {$_.Application -like "Microsoft Windows Desktop Runtime*" -and $_.Architecture -eq $NETRuntime.Architecture}) -eq $null)
+        {
+            $NewMarkedforAddition += $NETRuntime
+        } else {Write-Host "$($NetRuntime.Application) not needed as associated Windows Desktop Runtime includes it. Skipping..."}
+    }
+    $NewMarkedforAddition += $WithoutRuntime
+    $MarkedforAddition = $NewMarkedforAddition
+}
+
+
 $InstallArgs = @("/silent", "/quiet", "/norestart")
 foreach ($install in $MarkedforAddition)
 {
@@ -214,7 +248,7 @@ foreach ($install in $MarkedforAddition)
         if (Get-Item -Path "C:\temp\$SaveName")
         {
             Write-Host "[$(Get-Date -Format "yyyy-MM-dd HH:mm:ss")] Download saved to C:\temp\$SaveName"
-            Write-Host "[$(Get-Date -Format "yyyy-MM-dd HH:mm:ss")] Installing $install.Application ..."
+            Write-Host "[$(Get-Date -Format "yyyy-MM-dd HH:mm:ss")] Installing $($install.Application) ..."
             $proc = start-process "C:\temp\$SaveName" -ArgumentList $InstallArgs -Wait -PassThru
             if ($proc.exitcode -ne 0)
             {
@@ -243,4 +277,3 @@ if ($MarkedforAddition -eq $null)
 Write-Host "Completed .NET update script. Exiting..."
 Stop-Transcript
 exit $Exitcode
-
